@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+venv/
+
+# Data files (too large for GitHub)
+*.tif
+*.nc
+*.h5
+*.xlsx
+*.csv
+
+# Model weights
+*.weights.h5
+
+# Logs and outputs
+logs/
+*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store

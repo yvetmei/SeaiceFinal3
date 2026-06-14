@@ -1,0 +1,11 @@
+tensorflow>=2.11
+numpy
+pandas
+matplotlib
+openpyxl
+rasterio
+xarray
+netcdf4
+pyproj
+h5py
+requests
