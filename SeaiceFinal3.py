@@ -344,12 +344,17 @@ class _TifVelocitySampler:
 
 
 class _NcThicknessSampler:
-    """按月采样 SIT_25km_monthly_YYYYMM.nc 的 A/h (2D lat/lon 最近邻)。"""
-    def __init__(self, nc_dir, nc_pattern='SIT_25km_monthly_{ym}.nc'):
+    """采样 SIT_25km_monthly_YYYYMM.nc 的 A/h, 含空间 IDW + 跨月时间线性插值,
+    消除月度场作为逐时刻输入时的阶梯常数效应。"""
+    def __init__(self, nc_dir, nc_pattern='SIT_25km_monthly_{ym}.nc',
+                 spatial='idw', temporal=True, k_neighbors=4):
         if not HAS_XARRAY:
             raise ImportError('需要 xarray: pip install xarray netcdf4')
         self.nc_dir = nc_dir
         self.pattern = nc_pattern
+        self.spatial = spatial
+        self.temporal = bool(temporal)
+        self.k_neighbors = int(k_neighbors)
         self._cache = {}
 
     def _load_month(self, ym):
@@ -392,24 +397,85 @@ class _NcThicknessSampler:
         self._cache[ym] = (lat2d, lon2d, h2d, A2d)
         return self._cache[ym]
 
-    def sample(self, lat, lon, date):
-        m = self._load_month(date.strftime('%Y%m'))
+    def _sample_month(self, m, lat, lon):
         if m is None:
             return np.nan, np.nan
         lat2d, lon2d, h2d, A2d = m
-        d = (lat2d - lat) ** 2 + (lon2d - lon) ** 2
-        i, j = np.unravel_index(np.argmin(d), d.shape)
-        A = float(A2d[i, j]); h = float(h2d[i, j])
-        return (A if np.isfinite(A) else np.nan,
-                h if np.isfinite(h) else np.nan)
+        d2 = (lat2d - lat) ** 2 + (lon2d - lon) ** 2
+        if self.spatial == 'nearest':
+            i, j = np.unravel_index(np.argmin(d2), d2.shape)
+            A = float(A2d[i, j]); h = float(h2d[i, j])
+            return (A if np.isfinite(A) else np.nan,
+                    h if np.isfinite(h) else np.nan)
+        k = max(1, min(self.k_neighbors, d2.size))
+        flat = d2.ravel()
+        idx = np.argpartition(flat, k - 1)[:k]
+        Af = A2d.ravel()[idx]; hf = h2d.ravel()[idx]; df = flat[idx]
+        zero = df <= 1e-12
+        if np.any(zero):
+            A0 = Af[zero]; h0 = hf[zero]
+            A = float(A0[np.isfinite(A0)][0]) if np.any(np.isfinite(A0)) else np.nan
+            h = float(h0[np.isfinite(h0)][0]) if np.any(np.isfinite(h0)) else np.nan
+            return A, h
+        w = 1.0 / df
+        mA = np.isfinite(Af); mh = np.isfinite(hf)
+        A = float(np.sum(w[mA] * Af[mA]) / np.sum(w[mA])) if np.any(mA) else np.nan
+        h = float(np.sum(w[mh] * hf[mh]) / np.sum(w[mh])) if np.any(mh) else np.nan
+        return A, h
+
+    @staticmethod
+    def _month_anchor(year, month):
+        return datetime(year, month, 15)
+
+    def _bracket_months(self, date):
+        y, mo = date.year, date.month
+        anchor = self._month_anchor(y, mo)
+        if date >= anchor:
+            prev = (y, mo)
+            nxt = (y + 1, 1) if mo == 12 else (y, mo + 1)
+        else:
+            nxt = (y, mo)
+            prev = (y - 1, 12) if mo == 1 else (y, mo - 1)
+        return prev, nxt
+
+    def sample(self, lat, lon, date):
+        if not self.temporal:
+            m = self._load_month(date.strftime('%Y%m'))
+            return self._sample_month(m, lat, lon)
+        (py, pm), (ny, nm) = self._bracket_months(date)
+        t_prev = self._month_anchor(py, pm); t_next = self._month_anchor(ny, nm)
+        m_prev = self._load_month(f'{py:04d}{pm:02d}')
+        m_next = self._load_month(f'{ny:04d}{nm:02d}')
+        A_p, h_p = self._sample_month(m_prev, lat, lon)
+        A_n, h_n = self._sample_month(m_next, lat, lon)
+        span = (t_next - t_prev).total_seconds()
+        w = 0.0 if span <= 0 else (date - t_prev).total_seconds() / span
+        w = min(1.0, max(0.0, w))
+        def _interp(a, b):
+            if not np.isfinite(a) and not np.isfinite(b): return np.nan
+            if not np.isfinite(a): return b
+            if not np.isfinite(b): return a
+            return (1.0 - w) * a + w * b
+        return _interp(A_p, A_n), _interp(h_p, h_n)
 
 
 def build_dataset_from_dataForIce(base_dir, nc_dir=None,
                                   nc_pattern='SIT_25km_monthly_{ym}.nc',
-                                  resample_rule='1D', min_valid_ratio=1.0):
+                                  resample_rule='1D', min_valid_ratio=1.0,
+                                  max_gap_days=3, speed_jump_mps=0.5):
     """
     从 dataForIce 目录组装 4 维特征序列 [u, v, A, h]。
-    返回 (data[N,4], dates[N])。
+
+    *** 拉格朗日切段 ***
+    每条序列必须来自同一浮标(同一块冰)在时间上连续的一段轨迹。
+    因此本函数:
+      1) 按 buoy_id 分组, 组内按 time 升序;
+      2) 在时间空洞(> max_gap_days)或漂移速度突变(> speed_jump_mps,
+         视为碎裂/释放/进入开阔水)处切段;
+      3) 给每行打上全局唯一 seg_id, 供下游 create_sequences_grouped
+         做"段内滑窗", 严禁跨浮标/跨段拼接。
+
+    返回 (data[N,4], dates[N], seg_ids[N])。
     """
     excel_dir = os.path.join(base_dir, 'excel_data')
     tif_dir   = os.path.join(base_dir, 'tif_data')
@@ -431,14 +497,17 @@ def build_dataset_from_dataForIce(base_dir, nc_dir=None,
         gr = g[agg_cols].resample(resample_rule).mean().dropna(subset=['lat', 'lon'])
         gr['buoy_id'] = bid
         parts.append(gr.reset_index())
-    traj = pd.concat(parts, ignore_index=True).sort_values('time').reset_index(drop=True)
-    logging.info(f'重采样后轨迹点: {len(traj)}')
+    traj = pd.concat(parts, ignore_index=True)
+    # 关键: 按 (浮标, 时间) 排序, 而非全局只按 time 混排
+    traj = traj.sort_values(['buoy_id', 'time']).reset_index(drop=True)
+    logging.info(f'重采样后轨迹点: {len(traj)} (浮标 {traj["buoy_id"].nunique()} 个)')
 
     vel = _TifVelocitySampler(tif_dir)
     ncs = _NcThicknessSampler(nc_dir, nc_pattern=nc_pattern)
 
     logging.info('=== [dataForIce] 逐点采样 [u,v,A,h] ===')
     feats, dates, n_drop, n_selfuv = [], [], 0, 0
+    row_bid, row_time = [], []   # 与 feats 行对齐, 供切段
     n_uv_ok = n_A_ok = n_h_ok = 0
     for _, row in traj.iterrows():
         t = row['time'].to_pydatetime()
@@ -451,10 +520,9 @@ def build_dataset_from_dataForIce(base_dir, nc_dir=None,
             n_selfuv += 1
         else:
             u, v = vel.sample(lat, lon, t)
-        # A/h: 先从 nc 采样
+        # A/h: nc 月度厚度为主; 浓度优先用浮标逐点 m_conc(时间分辨率更高)
         A, h = ncs.sample(lat, lon, t)
-        # A: 若浮标自带 m_conc 且 nc 没采到, 用浮标的
-        if (not np.isfinite(A)) and has_buoy_A and np.isfinite(row.get('buoy_A', np.nan)):
+        if has_buoy_A and np.isfinite(row.get('buoy_A', np.nan)):
             A = float(row['buoy_A'])
         if np.isfinite(u) and np.isfinite(v): n_uv_ok += 1
         if np.isfinite(A): n_A_ok += 1
@@ -465,6 +533,8 @@ def build_dataset_from_dataForIce(base_dir, nc_dir=None,
             continue
         feats.append([x if np.isfinite(x) else 0.0 for x in vals])
         dates.append(t.strftime('%Y-%m-%d'))
+        row_bid.append(row['buoy_id'])
+        row_time.append(row['time'])
 
     data = np.array(feats, dtype=float)
     N = max(len(traj), 1)
@@ -474,6 +544,29 @@ def build_dataset_from_dataForIce(base_dir, nc_dir=None,
     if n_A_ok < 0.1 * N or n_h_ok < 0.1 * N:
         logging.warning('[dataForIce] *** A 或 h 有效率极低! 多半是 nc 文件名/年月没匹配上, '
                         '导致 A/h 被填 0。请检查 --nc_dir 路径和 --nc_pattern 文件名模板。***')
+
+    # ---- 拉格朗日切段: 同浮标 + 时间连续 + 无速度突变 才算一段 ----
+    seg_ids = np.full(len(data), -1, dtype=int)
+    if len(data):
+        row_time = pd.to_datetime(pd.Series(row_time)).reset_index(drop=True)
+        seg = 0
+        seg_ids[0] = 0
+        for i in range(1, len(data)):
+            same_buoy = (row_bid[i] == row_bid[i - 1])
+            gap_days = (row_time[i] - row_time[i - 1]).total_seconds() / 86400.0
+            # 速度突变: 当前点与前一点的 (u,v) 跳变幅度(m/s)
+            du = data[i, 0] - data[i - 1, 0]
+            dv = data[i, 1] - data[i - 1, 1]
+            jump = float(np.hypot(du, dv))
+            if (not same_buoy) or (gap_days > max_gap_days) or (jump > speed_jump_mps):
+                seg += 1
+            seg_ids[i] = seg
+        n_seg = len(np.unique(seg_ids))
+        seg_lens = np.bincount(seg_ids)
+        logging.info(f'[dataForIce] 拉格朗日切段: {n_seg} 段, '
+                     f'段长 min/中位/max = {seg_lens.min()}/{int(np.median(seg_lens))}/{seg_lens.max()} '
+                     f'(gap>{max_gap_days}d 或 速度跳变>{speed_jump_mps}m/s 处切断)')
+
     logging.info(f'[dataForIce] 最终特征: {data.shape} (丢弃 {n_drop}, '
                  f'其中 {n_selfuv} 点用浮标自带 ice_u/ice_v)')
     if len(data):
@@ -481,7 +574,7 @@ def build_dataset_from_dataForIce(base_dir, nc_dir=None,
                      f'v:{data[:,1].min():.3f}~{data[:,1].max():.3f} '
                      f'A:{data[:,2].min():.3f}~{data[:,2].max():.3f} '
                      f'h:{data[:,3].min():.3f}~{data[:,3].max():.3f}')
-    return data, dates
+    return data, dates, seg_ids
 
 
 def build_dataset_from_mixed_sources(excel_path: str, tif_dir: str,
@@ -695,6 +788,38 @@ def create_sequences(data: np.ndarray, look_back: int = 12):
         X.append(data[i: i + look_back])
         Y.append(data[i + look_back])
     return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
+
+
+def create_sequences_grouped(data: np.ndarray, look_back: int = 12,
+                             seg_ids: np.ndarray = None,
+                             return_owner: bool = False):
+    """
+    *** 段内滑窗 ***: 只在同一 seg_id 连续段内部构造 (X, Y), 窗口绝不跨段。
+    这是拉格朗日切段在序列层面的落地: 保证每个样本的 look_back 历史 +
+    预测目标都来自同一浮标的同一段连续轨迹。
+    seg_ids=None 时退化为普通 create_sequences (整段视为一段)。
+    return_owner=True 时额外返回每个样本所属的 seg_id (供按段切分 train/test)。
+    """
+    if seg_ids is None:
+        seg_ids = np.zeros(len(data), dtype=int)
+    X, Y, owner = [], [], []
+    n = len(data)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and seg_ids[j + 1] == seg_ids[i]:
+            j += 1
+        seg = data[i:j + 1]            # 一个连续段 [i, j]
+        for k in range(len(seg) - look_back):
+            X.append(seg[k:k + look_back])
+            Y.append(seg[k + look_back])
+            owner.append(int(seg_ids[i]))
+        i = j + 1
+    X = np.array(X, dtype=np.float32)
+    Y = np.array(Y, dtype=np.float32)
+    if return_owner:
+        return X, Y, np.array(owner, dtype=int)
+    return X, Y
 
 
 def create_sequences_weighted(data: np.ndarray, weights: np.ndarray,
@@ -1872,6 +1997,7 @@ if __name__ == '__main__':
 
     # ---- 数据加载 ----
     logging.info('开始加载数据...')
+    seg_ids = None
     try:
         if args.dataforice:
             logging.info(f'[模式] dataForIce 专用加载器: {args.base_dir}')
@@ -1879,7 +2005,7 @@ if __name__ == '__main__':
             _nc = args.nc_dir
             if _nc == 'E:/dataset/nc_monthly_data':
                 _nc = os.path.join(args.base_dir, 'nc_data')
-            data, dates = build_dataset_from_dataForIce(
+            data, dates, seg_ids = build_dataset_from_dataForIce(
                 base_dir=args.base_dir,
                 nc_dir=_nc,
                 nc_pattern=args.nc_pattern,
@@ -1908,12 +2034,27 @@ if __name__ == '__main__':
     # ---- 归一化与序列构造 ----
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(data)
-    X, y   = create_sequences(scaled, look_back=args.look_back)
+    # 段内滑窗: 窗口不跨浮标/不跨连续段 (拉格朗日)
+    X, y, owner = create_sequences_grouped(
+        scaled, look_back=args.look_back, seg_ids=seg_ids, return_owner=True)
+    if len(X) == 0:
+        raise RuntimeError(
+            f'段内滑窗后无可用样本: 多半是切段后每段都短于 look_back+1={args.look_back+1}。'
+            f'可减小 --look_back 或放宽切段阈值。')
 
-    # 时序顺序切分（严防数据泄露）
-    split             = int(0.8 * len(X))
-    X_train, X_test   = X[:split], X[split:]
-    y_train, y_test   = y[:split], y[split:]
+    # 切分: 按"段"而非按"行"切, 同一浮标的窗口不会被劈到 train/test 两边 (严防泄露)
+    uniq_segs = np.unique(owner)
+    if seg_ids is not None and len(uniq_segs) > 1:
+        n_seg_train = max(1, int(0.8 * len(uniq_segs)))
+        train_segs = set(uniq_segs[:n_seg_train].tolist())
+        tr_mask = np.array([o in train_segs for o in owner])
+        X_train, X_test = X[tr_mask], X[~tr_mask]
+        y_train, y_test = y[tr_mask], y[~tr_mask]
+        logging.info(f'按段切分: 训练 {n_seg_train} 段 / 测试 {len(uniq_segs)-n_seg_train} 段')
+    else:
+        split = int(0.8 * len(X))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
     logging.info(f'训练集: {X_train.shape}，测试集: {X_test.shape}')
 
     # TF 常量（量纲恢复，供 @tf.function 内使用）
@@ -2132,9 +2273,25 @@ if __name__ == '__main__':
     # 物理边界 (反归一化空间): A ∈ [0,1], h ≥ 0; depth (若存在第 5 维) 在递归时强制覆盖回真值
     phys_min = np.array([-np.inf, -np.inf, 0.0, 0.0, 0.0][:feat_dim], dtype=np.float32)
     phys_max = np.array([ np.inf,  np.inf, 1.0, np.inf, np.inf][:feat_dim], dtype=np.float32)
-    static_depth = scaled[-1, 4] if feat_dim >= 5 else None  # 深度是静态场, 不可外推
 
-    seq   = scaled[-args.look_back:].copy()
+    # 预测种子必须取自"同一条连续轨迹的末尾", 否则 look_back 窗口会跨浮标 -> 伪历史。
+    if seg_ids is not None and len(seg_ids) == len(scaled):
+        last_seg = seg_ids[-1]
+        seg_mask = (seg_ids == last_seg)
+        seg_rows = np.where(seg_mask)[0]
+        if len(seg_rows) >= args.look_back:
+            seed_idx = seg_rows[-args.look_back:]
+        else:
+            logging.warning(f'末段长度 {len(seg_rows)} < look_back {args.look_back}, '
+                            f'预测种子退回全局尾部(可能跨段)。')
+            seed_idx = np.arange(len(scaled) - args.look_back, len(scaled))
+    else:
+        seed_idx = np.arange(len(scaled) - args.look_back, len(scaled))
+    seed_scaled = scaled[seed_idx].copy()
+
+    static_depth = seed_scaled[-1, 4] if feat_dim >= 5 else None  # 深度是静态场, 不可外推
+
+    seq   = seed_scaled.copy()
     preds = []
     for _ in range(predict_steps):
         inp = seq.reshape(1, args.look_back, feat_dim)
@@ -2158,7 +2315,7 @@ if __name__ == '__main__':
     # ---- v3: 不确定性估计 + OOD 预警 ----
     pred_std = None
     if args.uncertainty != 'none':
-        seq_init = scaled[-args.look_back:].copy()
+        seq_init = seed_scaled.copy()
         if args.uncertainty == 'mc_dropout':
             logging.info(f'MC Dropout 不确定性估计 ({args.mc_samples} 次采样)...')
             mc_mean, pred_std = predict_mc_dropout(
@@ -2221,7 +2378,13 @@ if __name__ == '__main__':
             print(f"{dt:<22}" + "".join(f"{v:<12.5f}" for v in pred[:feat_dim]))
 
     # ---- JSON 导出 ----
-    export_json(data, preds_inv, dates_pred, args.log_dir, ts, predict_steps, pred_std=pred_std)
+    # 导出 JSON 的历史也用末段连续轨迹 (与预测同源)
+    if seg_ids is not None and len(seg_ids) == len(data):
+        _last_rows = np.where(seg_ids == seg_ids[-1])[0]
+        data_for_export = data[_last_rows[-100:]] if len(_last_rows) else data[-100:]
+    else:
+        data_for_export = data[-100:]
+    export_json(data_for_export, preds_inv, dates_pred, args.log_dir, ts, predict_steps, pred_std=pred_std)
 
     # ---- 可视化 (英文标签, 避免中文字体缺失) ----
     if data.shape[1] >= 2:
@@ -2230,7 +2393,13 @@ if __name__ == '__main__':
         feat_names = ['u (East, m/s)', 'v (North, m/s)',
                       'A (Concentration)', 'h (Thickness, m)'][:feat_dim]
         n_hist = min(60, len(data))
-        hist = data[-n_hist:]
+        # 历史曲线也只展示"末段"连续轨迹, 与预测种子同源, 避免画出跨浮标的伪历史
+        if seg_ids is not None and len(seg_ids) == len(data):
+            last_seg_rows = np.where(seg_ids == seg_ids[-1])[0]
+            hist = data[last_seg_rows[-n_hist:]] if len(last_seg_rows) >= 1 else data[-n_hist:]
+            n_hist = len(hist)
+        else:
+            hist = data[-n_hist:]
         hist_x = list(range(-n_hist + 1, 1))            # 历史步 (..., -1, 0)
         pred_x = list(range(1, predict_steps + 1))       # 预测步 (1, 2, ...)
 
