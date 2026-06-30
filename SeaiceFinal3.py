@@ -2,8 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
-os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')   # 隐藏 TF INFO/WARNING C++ 日志
-os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  # 关 oneDNN 提示
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')  
+os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')  
 import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
@@ -142,7 +142,6 @@ def sample_h5_depth(h5_path: str, lon: float, lat: float,
                     var_name: str = 'depth') -> float:
     """
     从静态地形深度 .h5 文件中进行最近邻点匹配采样。
-    期望数据集: depth[lat, lon] / lat[...] / lon[...]
     """
     if not HAS_H5PY or not os.path.exists(h5_path):
         return np.nan
@@ -171,7 +170,7 @@ SIC_PERCENT_TO_FRAC = 0.01   # nc 密集度百分数 -> 0-1
 def _match_col(cols, candidates, prefixes):
     """
     在列名字典 cols(小写->原名) 中匹配列。
-    先精确匹配 candidates, 再按 prefixes 前缀匹配 (容忍 time0/lat0/lon0 等后缀)。
+    先精确匹配 candidates, 再按 prefixes 前缀匹配
     """
     for k in candidates:
         if k in cols:
@@ -185,13 +184,7 @@ def _match_col(cols, candidates, prefixes):
 
 def _load_buoy_files(excel_dir, doy_base_year=2018):
     """
-    读取 excel_data 下所有浮标 xlsx, 合并为按时间排序的 DataFrame。
-    返回列: time, lat, lon, buoy_id, (可选)ice_u, ice_v。
-
-    兼容多种表头:
-      - Time, Day of year, Lat, Long      (Buoy01-09)
-      - time0, lat0, lon0                 (Buoy10-33, buoy1-9)
-      - time0, lat0, lon0, ice_u, ice_v, ...  (Buoy13/17 等, 带现成速度)
+    读取 excel_data 下所有浮标 xlsx, 合并为按时间排序的 DataFrame
     """
     files = sorted(glob.glob(os.path.join(excel_dir, '*.xlsx')))
     if not files:
@@ -206,38 +199,31 @@ def _load_buoy_files(excel_dir, doy_base_year=2018):
             logging.warning(f'读取 {fp} 失败: {e}')
             continue
         cols = {c.lower().strip(): c for c in df.columns}
-
-        # --- 时间列识别 (重构, 修复 day-of-year-only 文件误选 lat 列) ---
         lat_c = _match_col(cols, ('lat', 'latitude'),          ('lat',))
         lon_c = _match_col(cols, ('long', 'lon', 'longitude'), ('lon', 'long'))
 
-        time_c = None       # 真实日期列
-        doy_c  = None       # day-of-year 列 (无真实日期时的后备)
-        # 1) 精确名 time/datetime/date
+        time_c = None       
+        doy_c  = None       
         for k in ('time', 'datetime', 'date'):
             if k in cols:
                 time_c = cols[k]; break
-        # 2) 无名第一列 (Unnamed: 0) 若能解析成真实日期
         if time_c is None:
             for c in df.columns:
                 if str(c).lower().startswith('unnamed'):
                     p = pd.to_datetime(df[c], errors='coerce')
                     if p.notna().mean() > 0.8 and (p.dropna().dt.year >= 1990).mean() > 0.5:
                         time_c = c; break
-        # 3) 其余列: 区分"真实日期列"与"day-of-year 列"(排除 lat/lon 本身)
         if time_c is None:
             for c in df.columns:
                 if c in (lat_c, lon_c):
                     continue
                 low = str(c).lower()
                 num = pd.to_numeric(df[c], errors='coerce')
-                # day-of-year 候选: 数值集中在 1~550 (允许跨年)
                 if (low.startswith('time') or 'doy' in low or 'day' in low) \
                         and num.notna().mean() > 0.8 and num.dropna().between(1, 550).all():
                     if doy_c is None:
                         doy_c = c
                     continue
-                # 真实日期列候选: 能解析成 1990 年以后的日期
                 p = pd.to_datetime(df[c], errors='coerce')
                 if p.notna().mean() > 0.8 and (p.dropna().dt.year >= 1990).mean() > 0.5:
                     time_c = c; break
@@ -247,11 +233,10 @@ def _load_buoy_files(excel_dir, doy_base_year=2018):
             n_skip += 1
             continue
 
-        # 解析时间: 优先真实日期列; 否则用 day-of-year 还原
         if time_c is not None:
             parsed_time = pd.to_datetime(df[time_c], errors='coerce')
             if (parsed_time.dropna().dt.year < 1990).mean() > 0.5 and doy_c is not None:
-                time_c = None  # 真实列其实不可靠, 回退到 doy
+                time_c = None  
         if time_c is None:
             num = pd.to_numeric(df[doy_c], errors='coerce')
             base = pd.Timestamp(doy_base_year, 1, 1)
@@ -264,11 +249,9 @@ def _load_buoy_files(excel_dir, doy_base_year=2018):
             'lat':  pd.to_numeric(df[lat_c], errors='coerce'),
             'lon':  pd.to_numeric(df[lon_c], errors='coerce'),
         }
-        # m_conc (海冰密集度百分数) 若存在, 作为 A 的真实来源
         mconc_c = _match_col(cols, ('m_conc', 'conc', 'concentration', 'sic'), ('m_conc',))
         if mconc_c:
-            data['buoy_A'] = pd.to_numeric(df[mconc_c], errors='coerce') * 0.01  # %->0-1
-        # 若浮标自带 ice_u/ice_v (现成真实速度), 一并提取
+            data['buoy_A'] = pd.to_numeric(df[mconc_c], errors='coerce') * 0.01  
         iceu_c = _match_col(cols, ('ice_u', 'u', 'u_ice'), ('ice_u',))
         icev_c = _match_col(cols, ('ice_v', 'v', 'v_ice'), ('ice_v',))
         if iceu_c and icev_c:
@@ -284,7 +267,6 @@ def _load_buoy_files(excel_dir, doy_base_year=2018):
                      f'[{sub.time.min()} ~ {sub.time.max()}]{extra}')
     if not frames:
         raise RuntimeError('没有任何浮标文件读取成功')
-    # 对齐列(部分浮标无 ice_u/ice_v, 用 NaN 补齐)
     allbuoy = pd.concat(frames, ignore_index=True).sort_values('time').reset_index(drop=True)
     logging.info(f'合并浮标点总数: {len(allbuoy)}, 浮标数: {allbuoy.buoy_id.nunique()}'
                  f'{f", 跳过 {n_skip} 个" if n_skip else ""}')
@@ -294,9 +276,8 @@ def _load_buoy_files(excel_dir, doy_base_year=2018):
 class _TifVelocitySampler:
     """
     按日期采样 u/v tif (EPSG:3413)。
-    真实命名 (经核对): u/v 同在 tif_dir/v 目录:
-      {YYYYMMDD}v_uv.tif  -> u 分量 (东向)
-      {YYYYMMDD}v_vv.tif  -> v 分量 (北向)
+      {YYYYMMDD}v_uv.tif  -> u 分量 (东西向)
+      {YYYYMMDD}v_vv.tif  -> v 分量 (南北向)
     """
     def __init__(self, tif_dir):
         # u/v 都在 v 子目录; 若无 v 子目录则退回 tif_dir 本身
@@ -362,14 +343,12 @@ class _NcThicknessSampler:
             return self._cache[ym]
         fp = os.path.join(self.nc_dir, self.pattern.format(ym=ym))
         if not os.path.exists(fp):
-            # 鲁棒匹配: 文件名里同时含年(YYYY)和月(MM)即可,
-            # 兼容 SIT_..._201801.nc / SIT_..._2018_01.nc / SIT_..._2018-01.nc 等
             yyyy, mm = ym[:4], ym[4:6]
             cand = []
             for f in os.listdir(self.nc_dir):
                 if not f.endswith('.nc'):
                     continue
-                if ym in f:                       # 直接含 YYYYMM
+                if ym in f:                       
                     cand.append(f)
                 elif yyyy in f and (f'_{mm}' in f or f'-{mm}' in f
                                     or f'{mm}.' in f.split(yyyy)[-1]):
@@ -463,20 +442,6 @@ def build_dataset_from_dataForIce(base_dir, nc_dir=None,
                                   nc_pattern='SIT_25km_monthly_{ym}.nc',
                                   resample_rule='1D', min_valid_ratio=1.0,
                                   max_gap_days=3, speed_jump_mps=0.5):
-    """
-    从 dataForIce 目录组装 4 维特征序列 [u, v, A, h]。
-
-    *** 拉格朗日切段 ***
-    每条序列必须来自同一浮标(同一块冰)在时间上连续的一段轨迹。
-    因此本函数:
-      1) 按 buoy_id 分组, 组内按 time 升序;
-      2) 在时间空洞(> max_gap_days)或漂移速度突变(> speed_jump_mps,
-         视为碎裂/释放/进入开阔水)处切段;
-      3) 给每行打上全局唯一 seg_id, 供下游 create_sequences_grouped
-         做"段内滑窗", 严禁跨浮标/跨段拼接。
-
-    返回 (data[N,4], dates[N], seg_ids[N])。
-    """
     excel_dir = os.path.join(base_dir, 'excel_data')
     tif_dir   = os.path.join(base_dir, 'tif_data')
     if nc_dir is None:
@@ -554,7 +519,6 @@ def build_dataset_from_dataForIce(base_dir, nc_dir=None,
         for i in range(1, len(data)):
             same_buoy = (row_bid[i] == row_bid[i - 1])
             gap_days = (row_time[i] - row_time[i - 1]).total_seconds() / 86400.0
-            # 速度突变: 当前点与前一点的 (u,v) 跳变幅度(m/s)
             du = data[i, 0] - data[i - 1, 0]
             dv = data[i, 1] - data[i - 1, 1]
             jump = float(np.hypot(du, dv))
@@ -621,10 +585,6 @@ def build_dataset_from_mixed_sources(excel_path: str, tif_dir: str,
     valid_mask  = np.isfinite(final_feats).all(axis=1)
     print(f"  [集成完毕] 输出 {np.sum(valid_mask)} 个完全对齐的 5 维时序样本。")
     return final_feats[valid_mask], dates[valid_mask]
-
-
-
-# 二、纯 NC 目录数据输入（备用路径，无 Excel/TIF/H5 时使用）
 
 def _parse_date_from_filename(fn: str):
     m = re.search(r'(\d{8})', fn)
@@ -708,7 +668,6 @@ def build_dataset_from_nc_dir(nc_dir: str, days: int = 730,
                 print(f"  成功提取 {len(feats)} 个时间点的数据。")
                 return np.vstack(feats), np.array(dates)
 
-    # --- 空间均值 ---
     if HAS_UVAH:
         feats, dates = [], []
         for fp in filepaths:
@@ -727,7 +686,6 @@ def build_dataset_from_nc_dir(nc_dir: str, days: int = 730,
         valid = np.isfinite(feats).all(axis=1)
         return feats[valid], np.array(dates)[valid]
 
-    # --- 伪标签（质心差分） ---
     print('[信息] 未找到 u/v/A/h 字段，从可用标量场生成伪标签...')
     SNOW_CANDS = ('Snow_Depth', 'SnowDepth', 'snow_depth')
     arrays, dates = [], []
@@ -793,13 +751,6 @@ def create_sequences(data: np.ndarray, look_back: int = 12):
 def create_sequences_grouped(data: np.ndarray, look_back: int = 12,
                              seg_ids: np.ndarray = None,
                              return_owner: bool = False):
-    """
-    *** 段内滑窗 ***: 只在同一 seg_id 连续段内部构造 (X, Y), 窗口绝不跨段。
-    这是拉格朗日切段在序列层面的落地: 保证每个样本的 look_back 历史 +
-    预测目标都来自同一浮标的同一段连续轨迹。
-    seg_ids=None 时退化为普通 create_sequences (整段视为一段)。
-    return_owner=True 时额外返回每个样本所属的 seg_id (供按段切分 train/test)。
-    """
     if seg_ids is None:
         seg_ids = np.zeros(len(data), dtype=int)
     X, Y, owner = [], [], []
@@ -824,12 +775,7 @@ def create_sequences_grouped(data: np.ndarray, look_back: int = 12,
 
 def create_sequences_weighted(data: np.ndarray, weights: np.ndarray,
                               look_back: int = 12):
-    """
-    带样本权重的序列构造 (v3 弱标签用)。
-    每个目标点 data[i+look_back] 关联一个权重 weights[i+look_back],
-    用于在损失中对"不确定的弱标签"降权。
-    返回 X, Y, W (W 与 Y 行对齐)。
-    """
+
     X, Y, W = [], [], []
     for i in range(len(data) - look_back):
         X.append(data[i: i + look_back])
@@ -840,13 +786,11 @@ def create_sequences_weighted(data: np.ndarray, weights: np.ndarray,
             np.array(W, dtype=np.float32))
 
 
-# 三-B、自由漂移物理模拟器 —— 生成 2021-2025 伪标签
-
-ALPHA_2021, ALPHA_2025 = 0.018, 0.024     # 风因子线性区间 (参照观测趋势)
-THETA_2021, THETA_2025 = 25.0, 18.0       # 转向角(度), 随年份减小
-SIC_LOW_THRESHOLD       = 0.70            # 低密集度阈值
-SIC_LOW_ALPHA_BOOST     = 1.25            # SIC<0.7 时风因子放大系数
-OMEGA = 7.2921e-5                          # 地球自转角速度 (rad/s), 备用
+ALPHA_2021, ALPHA_2025 = 0.018, 0.024    
+THETA_2021, THETA_2025 = 25.0, 18.0       
+SIC_LOW_THRESHOLD       = 0.70            
+SIC_LOW_ALPHA_BOOST     = 1.25           
+OMEGA = 7.2921e-5                          
 
 
 def _alpha_for_year(year: int) -> float:
@@ -869,11 +813,6 @@ def _rotate(u: float, v: float, theta_deg: float):
 
 
 def _synthetic_wind(lon: float, lat: float, t: datetime):
-    """
-    合成 10m 风场 (m/s), 当无真实 ERA5 时的回退方案。
-    含: 大尺度穿极漂流方向偏置 + 季节调制 + 随机扰动。
-    返回 (u_wind, v_wind)。
-    """
     doy = t.timetuple().tm_yday
     seasonal = 1.0 + 0.4 * np.cos(2 * np.pi * (doy - 30) / 365.0)  # 冬强夏弱
     # 穿极漂流: 大致从西伯利亚一侧吹向 Fram 海峡, 这里给一个经度相关方向场
@@ -887,10 +826,6 @@ def _synthetic_wind(lon: float, lat: float, t: datetime):
 
 
 def _sample_wind_from_nc(wind_nc_dir, lon, lat, t):
-    """
-    尝试从真实风场 NC 目录读取 (u10, v10)。
-    文件名需含 YYYYMMDD; 变量名尝试 u10/v10/u/v。读不到返回 None。
-    """
     if not wind_nc_dir or not HAS_XARRAY or not os.path.isdir(wind_nc_dir):
         return None
     date_str = t.strftime('%Y%m%d')
@@ -946,24 +881,6 @@ def simulate_free_drift_pseudolabels(
         integrate_hours=48, substep_hours=6,
         sic_field_fn=None, depth_fn=None,
         samples_per_year=400, seed=42):
-    """
-    用自由漂移经验式生成伪标签轨迹数据集。
-
-    参数:
-      start_points    : list[(lon, lat)] 起始位置候选 (可用 2016-2020 分布或冰缘线采样)
-      sim_years       : list[int] 模拟年份, 如 [2021,2022,2023,2024,2025]
-      wind_nc_dir     : 真实风场目录, None 则用合成风场
-      integrate_hours : 单条轨迹前推总时长 (24~72)
-      substep_hours   : 欧拉子步长 (默认 6h, 减小累积误差)
-      sic_field_fn    : 可选函数 (lon,lat,t)->SIC, 缺省随机给 [0.5,0.95]
-      depth_fn        : 可选函数 (lon,lat)->depth, 缺省给常数占位
-      samples_per_year: 每年生成多少条轨迹样本
-      seed            : 随机种子
-
-    返回:
-      dict[int -> (feats, dates)]  每年一份 (N,5)=[u,v,A,h,depth] 时序与日期串。
-      注: 这里把"一条轨迹的逐步特征"拼成时序, 便于直接喂给 create_sequences。
-    """
     rng = np.random.default_rng(seed)
     n_sub = max(1, int(integrate_hours // substep_hours))
     dt_s  = substep_hours * 3600.0
@@ -975,7 +892,6 @@ def simulate_free_drift_pseudolabels(
         feats, dates = [], []
 
         for _ in range(samples_per_year):
-            # 起点 + 起始日期 (年内随机一天)
             lon, lat = start_points[rng.integers(0, len(start_points))]
             lon = float(lon) + float(rng.normal(0, 0.5))
             lat = float(lat) + float(rng.normal(0, 0.3))
@@ -983,7 +899,7 @@ def simulate_free_drift_pseudolabels(
             t   = datetime(year, 1, 1) + timedelta(days=doy)
 
             for _ in range(n_sub):
-                # 1) 取风场 (真实优先, 否则合成)
+                # 1) 取风场
                 w = _sample_wind_from_nc(wind_nc_dir, lon, lat, t)
                 if w is None:
                     w = _synthetic_wind(lon, lat, t)
@@ -1023,42 +939,22 @@ def simulate_free_drift_pseudolabels(
 
 
 def make_start_points_from_history(data, dates):
-    """
-    从历史真实数据反推起始位置候选。
-    若无经纬度列(本管线特征是 u/v/A/h/depth, 无 lon/lat), 则回退到北极常见漂流区采样。
-    """
-    # 本特征集中不含经纬度, 直接给北极一组代表性起点 (穿极漂流 + 波弗特环流区)
     pts = [(-150, 75), (-140, 78), (160, 80), (140, 82),
            (100, 81), (60, 83), (0, 84), (-60, 80), (-90, 77)]
     return pts
 
-
-# 三-C、低分辨率漂移产品 -> 弱标签 (v3 新增, 推荐路径)
-
 DRIFT_UNIT_TO_MS = 1000.0 / (2 * 86400.0)
 
-
 def _compute_true_uv_from_osisaf(ds, feat_dim=4, default_A=0.85, default_h=1.8):
-    """
-    OSI SAF 漂移文件专用: 用位移起止经纬度计算"真东向/真北向"速度 (m/s)。
-
-    为什么不直接用 dX/dY:
-      dX/dY 的 long_name 是 "沿网格 x/y 轴的位移分量", 方向是极地立体投影
-      的网格轴, 不是真东/真北。直接当 u/v 会引入随经度变化的旋转误差。
-      本函数用 lat/lon(起点) 与 lat1/lon1(终点) 算真实东北位移, 绕开该问题。
-
-    返回 (u_ms, v_ms, weight) 三个标量 (全场有效点的均值), 失败返回 None。
-    """
     needed = ('lat', 'lon', 'lat1', 'lon1')
     if not all(n in ds for n in needed):
-        return None  # 不是 OSI SAF 标准漂移文件
-
+        return None  
     lat0 = np.asarray(ds['lat'].values, dtype=float)         # 2D 起点
     lon0 = np.asarray(ds['lon'].values, dtype=float)
     lat1 = np.asarray(ds['lat1'].values, dtype=float).squeeze()  # 终点
     lon1 = np.asarray(ds['lon1'].values, dtype=float).squeeze()
 
-    # 有效掩膜 (排除缺测, OSI SAF 缺测常为 -1e10 量级)
+    
     mask = (np.isfinite(lat1) & np.isfinite(lon1) &
             (lat1 > -990) & (lon1 > -990))
     if mask.sum() < 5:
@@ -1067,21 +963,21 @@ def _compute_true_uv_from_osisaf(ds, feat_dim=4, default_A=0.85, default_h=1.8):
     R = 6371000.0
     dlat = np.deg2rad(lat1 - lat0)
     dlon_deg = lon1 - lon0
-    dlon_deg = (dlon_deg + 180.0) % 360.0 - 180.0   # 经度环绕修正 (跨±180)
+    dlon_deg = (dlon_deg + 180.0) % 360.0 - 180.0   
     dlon = np.deg2rad(dlon_deg)
     lat_mean = np.deg2rad((lat0 + lat1) / 2.0)
-    east_m  = R * np.cos(lat_mean) * dlon            # 真东向位移 (m)
-    north_m = R * dlat                                # 真北向位移 (m)
+    east_m  = R * np.cos(lat_mean) * dlon            
+    north_m = R * dlat                                
 
-    dt_s = 2 * 86400.0   # 名义 48 小时
+    dt_s = 2 * 86400.0   
     u = east_m / dt_s
     v = north_m / dt_s
 
-    # 区域均值 (作该日代表值)
+
     u_ms = float(np.mean(u[mask]))
     v_ms = float(np.mean(v[mask]))
 
-    # 不确定性 -> 权重
+    
     weight = 0.6
     if 'uncert_dX_and_dY' in ds:
         unc = np.asarray(ds['uncert_dX_and_dY'].values, dtype=float).squeeze()
@@ -1098,18 +994,7 @@ def load_drift_weak_labels(drift_nc_dir, sim_years,
                            target_lat=None, target_lon=None,
                            unit_to_ms=DRIFT_UNIT_TO_MS,
                            feat_dim=4, default_A=0.85, default_h=1.8):
-    """
-    从低分辨率漂移产品 NC 目录读取弱标签, 按年份聚合。
-
-    优先用 OSI SAF 标准文件 (含 lat/lon/lat1/lon1) 计算真东北向速度;
-    若不是该格式, 回退到直接读 dX/dY 等变量并做单位换算。
-
-    返回:
-      dict[int -> (feats, dates, weights)]
-        feats   : (N, feat_dim) 前两维为 [u, v] (m/s), 其余维用 A/h 缺省值占位
-        weights : (N,) 样本权重 ∈ (0,1], 由产品不确定性反推
-    说明: 文件名需含 YYYYMMDD 或 YYYY 以归类年份。
-    """
+   
     if not HAS_XARRAY or not drift_nc_dir or not os.path.isdir(drift_nc_dir):
         logging.warning('[弱标签] xarray 不可用或目录无效, 跳过弱标签加载。')
         return {}
@@ -1157,9 +1042,9 @@ def load_drift_weak_labels(drift_nc_dir, sim_years,
             if not (np.isfinite(u_ms) and np.isfinite(v_ms)):
                 continue
 
-            # 组装特征行 (前2维 u/v, 其余用 A/h 缺省占位到 feat_dim)
+            
             row = [u_ms, v_ms]
-            extras = [default_A, default_h, 1500.0]  # A, h, depth(若需要)
+            extras = [default_A, default_h, 1500.0]  
             row += extras[:max(0, feat_dim - 2)]
             row = row[:feat_dim]
 
@@ -1185,13 +1070,7 @@ def load_drift_weak_labels(drift_nc_dir, sim_years,
     return result
 
 
-# 四、Physics-Informed LSTM 模型构建
-
 def build_pinn_lstm(look_back: int, feat_dim: int) -> tf.keras.Model:
-    """
-    构建 PI-LSTM 网络（Functional API）。
-    结构: Input → LSTM(64,seq) → Dropout(0.3) → LSTM(32) → Dropout(0.3) → Dense(feat_dim)
-    """
     inputs  = tf.keras.Input(shape=(look_back, feat_dim), name='seq_input')
     h       = LSTM(64, return_sequences=True, name='lstm_1')(inputs)
     h       = Dropout(0.3, name='drop_1')(h)
@@ -1201,43 +1080,29 @@ def build_pinn_lstm(look_back: int, feat_dim: int) -> tf.keras.Model:
     return tf.keras.Model(inputs=inputs, outputs=outputs, name='PI_LSTM')
 
 
-# 五、海冰物理约束损失函数（真·PI-LSTM 核心）
-
 def make_train_step(model, optimizer, data_scale_tf, data_mean_tf,
                     t_std_tf, pinn_weight: float):
-    """
-    返回 @tf.function 加速的单步训练函数。
-    物理方程体系（简化参考 CICE 模型）：
-      1. 冰动量方程 (u/v): du/dt = τ_air - C_d*u ∓ f*v
-      2. 密集度守恒 (A):   dA/dt = S_A * (1 - A)
-      3. 冰厚守恒  (h):   dh/dt = S_h * (1 - h)
-    注意: depth 为静态场，不参与物理残差。
-    """
     @tf.function
     def train_step(x_batch, y_batch):
         with tf.GradientTape() as tape:
-            # ---- A. 数据拟合损失 (归一化空间 MSE) ----
             y_pred_norm = model(x_batch, training=True)
             data_loss   = tf.reduce_mean(tf.square(y_pred_norm - y_batch))
 
-            # ---- B. 物理动力学残差约束 ----
-            # 反归一化到真实物理量纲
-            y_pred_phys = (y_pred_norm - data_mean_tf) / data_scale_tf          # 修复: MinMax逆变换
-            x_last_phys = (x_batch[:, -1, :] - data_mean_tf) / data_scale_tf    # 修复: MinMax逆变换
+            y_pred_phys = (y_pred_norm - data_mean_tf) / data_scale_tf          
+            x_last_phys = (x_batch[:, -1, :] - data_mean_tf) / data_scale_tf    
 
             u_pred = y_pred_phys[:, 0]
             v_pred = y_pred_phys[:, 1]
             A_pred = y_pred_phys[:, 2]
             h_pred = y_pred_phys[:, 3]
-            # feat[:, 4] = depth 静态场，跳过
+            
 
-            # 时间差分近似导数 (Δt = 1 天 = 86400 s)
             du_dt = (u_pred - x_last_phys[:, 0]) / t_std_tf
             dv_dt = (v_pred - x_last_phys[:, 1]) / t_std_tf
             dA_dt = (A_pred - x_last_phys[:, 2]) / t_std_tf
             dh_dt = (h_pred - x_last_phys[:, 3]) / t_std_tf
 
-            # 物理参数（量级参考 CICE，可扩展为 argparse 参数）
+           
             air_forcing   = 0.05 * A_pred
             ocean_forcing = 0.02 * A_pred
             drag_coef     = 0.01
@@ -1255,7 +1120,7 @@ def make_train_step(model, optimizer, data_scale_tf, data_mean_tf,
                 0.5 * tf.reduce_mean(tf.square(res_h))
             )
 
-            # ---- C. 复合加权总损失 ----
+           
             total_loss = (1.0 - pinn_weight) * data_loss + pinn_weight * phys_loss
 
         grads = tape.gradient(total_loss, model.trainable_variables)
@@ -1264,8 +1129,6 @@ def make_train_step(model, optimizer, data_scale_tf, data_mean_tf,
 
     return train_step
 
-
-# 五-B、持续学习 (Continual Learning): Replay + EWC (v2 新增)
 
 def compute_fisher(model, X, y, batch_size=16):
     """
@@ -1292,11 +1155,6 @@ def compute_fisher(model, X, y, batch_size=16):
 
 def make_cl_train_step(model, optimizer, data_scale_tf, data_mean_tf, t_std_tf,
                        pinn_weight, ewc_lambda, fisher, star_vars):
-    """
-    带 EWC 正则的持续学习训练步。
-    总损失 = (数据 + 物理)损失 + (ewc_lambda/2) * Σ F_i (theta_i - theta*_i)^2
-    fisher / star_vars 为 None 或 ewc_lambda<=0 时退化为普通 PI-LSTM 训练。
-    """
     base_step = None  # 占位, 逻辑内联以共享 GradientTape
 
     @tf.function
@@ -1329,7 +1187,7 @@ def make_cl_train_step(model, optimizer, data_scale_tf, data_mean_tf, t_std_tf,
 
             total_loss = (1.0 - pinn_weight) * data_loss + pinn_weight * phys_loss
 
-            # ---- EWC 正则项 ----
+           
             ewc_loss = tf.constant(0.0, dtype=tf.float32)
             if ewc_lambda > 0 and fisher is not None and star_vars is not None:
                 for f, star, var in zip(fisher, star_vars, model.trainable_variables):
@@ -1349,20 +1207,7 @@ def continual_learning_loop(
         data_scale_tf, data_mean_tf, t_std_tf,
         pinn_weight, replay_ratio=0.15, ewc_lambda=0.0,
         epochs_per_year=20, batch_size=16, seed=42):
-    """
-    逐年持续学习主循环 (记忆重放 Replay, 可选 EWC)。
 
-    流程:
-      1. 从旧数据(已归一化 old_scaled)抽 replay_ratio 作记忆集 (固定不变)。
-      2. 对每个模拟年份:
-         - 把该年模拟数据用同一 scaler 归一化, 构造序列。
-         - 与记忆集序列按样本量平衡混合 (上采样记忆集到与新数据相当)。
-         - 训练 epochs_per_year 轮。
-      3. 若 ewc_lambda>0: 第一年训练后在旧数据上计算 Fisher 并冻结 theta*,
-         之后各年带 EWC 正则, 保护历史漂移模式参数。
-
-    返回: 训练后的 model。
-    """
     rng = np.random.default_rng(seed)
 
     # --- 记忆集 (旧任务序列) ---
@@ -1384,7 +1229,6 @@ def continual_learning_loop(
         sim_scaled = scaler.transform(sim_feats)
         X_new, y_new = create_sequences(sim_scaled, look_back=look_back)
 
-        # 记忆集上采样到与新数据相当, 防止被新分布淹没
         reps = max(1, len(X_new) // max(1, len(X_mem)))
         X_mem_rep = np.repeat(X_mem, reps, axis=0)
         y_mem_rep = np.repeat(y_mem, reps, axis=0)
@@ -1413,7 +1257,7 @@ def continual_learning_loop(
                              f'Total {e_tot/n:.6f} | Data {e_dat/n:.6f} | '
                              f'Phys {e_phy/n:.6f} | EWC {e_ewc/max(n,1):.6f}')
 
-        # 第一年训练完, 若启用 EWC 则冻结 Fisher 与最优参数
+        
         if ewc_lambda > 0 and fisher is None:
             logging.info(f'[CL] 在旧数据上计算 Fisher 信息 (EWC, lambda={ewc_lambda}) ...')
             fisher = compute_fisher(model, X_old, y_old, batch_size=batch_size)
@@ -1422,16 +1266,8 @@ def continual_learning_loop(
     return model
 
 
-# ============================================================
-# 五-C、弱标签逐年微调 (带样本权重 + Replay + 可选 EWC) (v3 新增)
-# ============================================================
-
 def make_weighted_cl_step(model, optimizer, data_scale_tf, data_mean_tf, t_std_tf,
                           pinn_weight, ewc_lambda, fisher, star_vars):
-    """
-    带样本权重的持续学习训练步。
-    数据损失对每个样本乘以 sample_weight (弱标签不确定性越大权重越小)。
-    """
     @tf.function
     def train_step(x_batch, y_batch, w_batch):
         with tf.GradientTape() as tape:
@@ -1483,14 +1319,7 @@ def weak_label_finetune_loop(
         data_scale_tf, data_mean_tf, t_std_tf,
         pinn_weight, replay_ratio=0.15, ewc_lambda=0.0,
         epochs_per_year=20, batch_size=16, seed=42):
-    """
-    用低分辨率漂移弱标签对预训练模型逐年微调 (带 Replay, 可选 EWC)。
 
-    与 continual_learning_loop 的区别:
-      - 新数据来自真实漂移产品弱标签 (非模拟), 每个标签带 sample_weight;
-      - 记忆集 (旧真实数据) 权重设为 1.0 (视为相对可靠);
-      - 数据损失按样本权重加权, 不确定的弱标签自动降权。
-    """
     rng = np.random.default_rng(seed)
     X_old, y_old = create_sequences(old_scaled, look_back=look_back)
     n_mem = max(1, int(replay_ratio * len(X_old)))
@@ -1498,7 +1327,7 @@ def weak_label_finetune_loop(
     X_mem, y_mem = X_old[mem_idx], y_old[mem_idx]
     logging.info(f'[弱标签CL] 记忆集: {len(X_mem)} / 旧数据 {len(X_old)}')
 
-    # 旧数据各维物理均值: 用于替换弱标签的占位 A/h (保证输入在训练分布内)
+   
     old_phys_mean = scaler.inverse_transform(old_scaled).mean(axis=0)
 
     fisher = star_vars = None
@@ -1509,13 +1338,11 @@ def weak_label_finetune_loop(
             logging.warning(f'[弱标签CL] {year} 年标签不足 (<2), 跳过')
             continue
 
-        # 占位维替换: 弱标签只有 u/v 是真实的, A/h(及depth)为占位 ->
-        # 换成旧数据物理均值, 避免离群占位值在归一化空间爆炸
         feats = feats.copy()
         if feats.shape[1] > 2:
             feats[:, 2:] = old_phys_mean[2:feats.shape[1]]
 
-        # ---- 月度标签插值加密 ----
+    
         if len(feats) < look_back + 2:
             n_target = max(look_back + 10, len(feats) * 6)
             xi = np.linspace(0, len(feats) - 1, n_target)
@@ -1528,12 +1355,12 @@ def weak_label_finetune_loop(
         scaled_y = scaler.transform(feats)
         Xw, yw, ww_scalar = create_sequences_weighted(scaled_y, weights, look_back=look_back)
 
-        # 逐维权重: 弱标签样本仅监督 u/v (前2维), A/h 等占位维掩码=0
+        
         dim_mask_weak = np.zeros(feat_dim, dtype=np.float32)
         dim_mask_weak[:2] = 1.0
-        ww = ww_scalar[:, None] * dim_mask_weak[None, :]        # (n_weak, feat_dim)
+        ww = ww_scalar[:, None] * dim_mask_weak[None, :]        
 
-        # 记忆集上采样平衡 (全维权重=1)
+
         reps = max(1, len(Xw) // max(1, len(X_mem)))
         X_mem_r = np.repeat(X_mem, reps, axis=0)
         y_mem_r = np.repeat(y_mem, reps, axis=0)
@@ -1570,7 +1397,6 @@ def weak_label_finetune_loop(
 
     return model
 
-# 五-D、预测不确定性估计 + OOD 预警 (v3 新增)
 
 def _phys_bounds(feat_dim):
     """递归预测时的物理边界 (反归一化空间)。A∈[0,1], h≥0; u/v 不限。"""
@@ -1591,12 +1417,7 @@ def _clip_to_scaled(p_norm, scaler, pmin, pmax, static_depth=None):
 
 def predict_mc_dropout(model, seq_init, scaler, look_back, feat_dim,
                        predict_steps, mc_samples=50):
-    """
-    MC Dropout 不确定性: 推理期保持 Dropout 开启 (training=True), 多次前向。
-    递归多步预测, 不确定性逐步累积。预测被 clip 到物理边界且静态深度强制还原,
-    防止长程递归漂出物理范围。
-    返回: mean (steps,feat), std (steps,feat) — 均为反归一化后的物理量纲。
-    """
+
     pmin, pmax = _phys_bounds(feat_dim)
     static_depth = seq_init[-1, 4] if feat_dim >= 5 else None
 
@@ -1614,11 +1435,7 @@ def predict_mc_dropout(model, seq_init, scaler, look_back, feat_dim,
 
 
 def predict_ensemble(models, seq_init, scaler, look_back, feat_dim, predict_steps):
-    """
-    Deep Ensemble 不确定性: 多个独立训练的模型分别递归预测, 用模型间分歧估计不确定性。
-    预测会被 clip 到物理边界 (A∈[0,1], h≥0), 静态深度递归时强制还原。
-    返回: mean (steps,feat), std (steps,feat) — 物理量纲。
-    """
+
     pmin, pmax = _phys_bounds(feat_dim)
     static_depth = seq_init[-1, 4] if feat_dim >= 5 else None
 
@@ -1636,10 +1453,7 @@ def predict_ensemble(models, seq_init, scaler, look_back, feat_dim, predict_step
 
 
 def fit_train_distribution(scaled_train):
-    """
-    估计训练分布 (归一化空间) 的均值与协方差逆, 供马氏距离 OOD 检测用。
-    返回 (mu, inv_cov)。
-    """
+
     mu = np.mean(scaled_train, axis=0)
     cov = np.cov(scaled_train, rowvar=False)
     cov += np.eye(cov.shape[0]) * 1e-4  # 数值稳定
@@ -1651,27 +1465,20 @@ def fit_train_distribution(scaled_train):
 
 
 def mahalanobis_ood(x_scaled, mu, inv_cov):
-    """单点马氏距离 (归一化空间)。值越大越偏离训练分布。"""
     d = x_scaled - mu
     return float(np.sqrt(max(d @ inv_cov @ d, 0.0)))
 
 
 def assess_ood(seq_init_scaled, mu, inv_cov, threshold=3.0):
-    """
-    对预测起始窗口逐步评估 OOD。
-    返回 list[(step_index, mahalanobis_distance, is_ood)]。
-    threshold 默认 3.0 (约对应多元正态的较高分位, 可按数据调)。
-    """
+
     flags = []
     for i, x in enumerate(seq_init_scaled):
         dist = mahalanobis_ood(x, mu, inv_cov)
         flags.append((i, dist, dist > threshold))
     return flags
-# ============================================================
 
 def get_user_input(default_lon=None, default_lat=None,
                    default_steps=None, default_days=None) -> dict:
-    """交互式获取经纬度与预测参数，命令行默认值作为提示。"""
     print("\n" + "=" * 50)
     print("  海冰漂移预测系统 — 参数输入")
     print("=" * 50)
@@ -1709,9 +1516,6 @@ def get_user_input(default_lon=None, default_lat=None,
             'predict_steps': steps, 'history_days': days}
 
 
-# ============================================================
-# 七、结果打印与 JSON 导出
-# ============================================================
 
 def print_prediction_result(predictions: np.ndarray, dates_pred: list,
                              lon: float, lat: float):
@@ -1733,8 +1537,7 @@ def print_prediction_result(predictions: np.ndarray, dates_pred: list,
 def export_json(data: np.ndarray, preds_inv: np.ndarray,
                 dates_pred: list, log_dir: str, ts: str,
                 predict_steps: int, pred_std: np.ndarray = None):
-    """导出可视化 JSON (带时间戳归档文件 + 滚动更新的 latest.json)。
-    pred_std 不为 None 时, 额外导出每步每特征的标准差与 95% 置信区间。"""
+
     feat_keys = ['u', 'v', 'A', 'h', 'depth'][:data.shape[1]]
 
     predicted = []
@@ -1769,16 +1572,8 @@ def export_json(data: np.ndarray, preds_inv: np.ndarray,
             logging.warning(f'JSON 导出失败 {fpath}: {e}')
 
 
-# ============================================================
-# 八、交互式遥感影像查看器（独立可调用）
-# ============================================================
-
 def interactive_viewer(nc_dir: str = '.', varname: str = None,
                        cmap: str = 'viridis', interval: int = 500):
-    """
-    交互式逐帧查看 NC 影像序列。
-    控件: Slider 帧选择 / Prev / Next / Play-Pause / 日期跳转输入框
-    """
     if not HAS_XARRAY:
         raise ImportError('xarray 未安装，无法使用查看器。pip install xarray netcdf4')
 
@@ -1860,15 +1655,13 @@ def interactive_viewer(nc_dir: str = '.', varname: str = None,
     plt.show()
 
 
-# 九、主入口
 if __name__ == '__main__':
 
-    # ---- 命令行参数 ----
     parser = argparse.ArgumentParser(
         description='海冰漂移 PI-LSTM 预测系统 — 多源数据融合版',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # 数据源（多源模式）
+
     parser.add_argument('--excel_path', default='E:/dataset/excel_data/drift.xlsx',
                         help='Excel 轨迹坐标表 (.xlsx)')
     parser.add_argument('--tif_dir',    default='E:/dataset/tif_data',
@@ -1950,7 +1743,6 @@ if __name__ == '__main__':
                         help='OOD 马氏距离预警阈值')
     args = parser.parse_args()
 
-    # ---- 日志配置 ----
     os.makedirs(args.log_dir, exist_ok=True)
     ts      = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     logfile = os.path.join(args.log_dir, f'seaice_run_{ts}.log')
@@ -1974,7 +1766,6 @@ if __name__ == '__main__':
     logging.info(f'日志文件: {logfile}')
     logging.info('=' * 60)
 
-    # ---- 交互式参数输入（可选）----
     target_lat    = target_lon = None
     predict_steps = args.predict_steps
 
@@ -1995,7 +1786,6 @@ if __name__ == '__main__':
     elif args.lon is not None and args.lat is not None:
         target_lon, target_lat = args.lon, args.lat
 
-    # ---- 数据加载 ----
     logging.info('开始加载数据...')
     seg_ids = None
     try:
@@ -2031,10 +1821,9 @@ if __name__ == '__main__':
         )
     logging.info(f'数据形状: {data.shape}，时间范围: {dates[0]} → {dates[-1]}')
 
-    # ---- 归一化与序列构造 ----
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(data)
-    # 段内滑窗: 窗口不跨浮标/不跨连续段 (拉格朗日)
+
     X, y, owner = create_sequences_grouped(
         scaled, look_back=args.look_back, seg_ids=seg_ids, return_owner=True)
     if len(X) == 0:
@@ -2042,7 +1831,7 @@ if __name__ == '__main__':
             f'段内滑窗后无可用样本: 多半是切段后每段都短于 look_back+1={args.look_back+1}。'
             f'可减小 --look_back 或放宽切段阈值。')
 
-    # 切分: 按"段"而非按"行"切, 同一浮标的窗口不会被劈到 train/test 两边 (严防泄露)
+
     uniq_segs = np.unique(owner)
     if seg_ids is not None and len(uniq_segs) > 1:
         n_seg_train = max(1, int(0.8 * len(uniq_segs)))
@@ -2057,7 +1846,7 @@ if __name__ == '__main__':
         y_train, y_test = y[:split], y[split:]
     logging.info(f'训练集: {X_train.shape}，测试集: {X_test.shape}')
 
-    # TF 常量（量纲恢复，供 @tf.function 内使用）
+
     _min   = scaler.min_   if hasattr(scaler, 'min_')   else np.nanmin(data, axis=0)
     _scale = scaler.scale_ if hasattr(scaler, 'scale_') else (
         np.nanmax(data, axis=0) - np.nanmin(data, axis=0))
@@ -2065,7 +1854,7 @@ if __name__ == '__main__':
     data_scale_tf = tf.constant(_scale,  dtype=tf.float32)
     t_std_tf      = tf.constant(86400.0, dtype=tf.float32)  # 1 天 = 86400 s
 
-    # ---- 构建模型 ----
+
     feat_dim  = X.shape[-1]
     model     = build_pinn_lstm(args.look_back, feat_dim)
     optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
@@ -2076,7 +1865,6 @@ if __name__ == '__main__':
         t_std_tf, args.pinn_weight
     )
 
-    # ---- 训练循环 ----
     logging.info(
         f'开始 PI-LSTM 训练: epochs={args.epochs}, '
         f'batch={args.batch_size}, pinn_weight={args.pinn_weight}'
@@ -2087,14 +1875,11 @@ if __name__ == '__main__':
                 .shuffle(len(X_train), seed=42)
                 .batch(args.batch_size))
 
-    # 验证集 (归一化空间 MSE) - 用于监控泛化与 early stopping
     val_ds = (tf.data.Dataset.from_tensor_slices((X_test, y_test))
               .batch(args.batch_size)) if len(X_test) > 0 else None
 
-    # 日志频率: 短跑 (≤20 epoch) 每轮打印, 长跑按 epochs/10 节奏打印
     log_every = 1 if args.epochs <= 20 else max(1, args.epochs // 10)
 
-    # Early stopping: 监控 val_loss; 训练完保留最佳权重
     best_val   = float('inf')
     best_w     = None
     patience   = max(5, args.epochs // 5)
@@ -2110,7 +1895,6 @@ if __name__ == '__main__':
             e_phys  += float(p_l)
             n_steps += 1
 
-        # 验证集 loss (仅数据 MSE, 用于早停)
         val_loss = None
         if val_ds is not None:
             v_sum = 0.0; v_n = 0
@@ -2141,12 +1925,10 @@ if __name__ == '__main__':
                          f'best val={best_val:.6f})')
             break
 
-    # 恢复 val 最佳权重 (若启用了验证集且记录了 best_w)
     if best_w is not None:
         model.set_weights(best_w)
         logging.info(f'已恢复验证集最佳权重 (val_loss={best_val:.6f})')
 
-    # 保存模型权重
     ckpt_path = os.path.join(args.log_dir, f'model_{ts}.weights.h5')
     try:
         model.save_weights(ckpt_path)
@@ -2154,7 +1936,6 @@ if __name__ == '__main__':
     except Exception as e:
         logging.warning(f'权重保存失败: {e}')
 
-    # ---- v2: 持续学习更新 (Replay + 可选 EWC) ----
     if args.continual:
         logging.info('=' * 60)
         logging.info('进入持续学习阶段: 物理模拟伪标签 + Replay/EWC')
@@ -2166,10 +1947,8 @@ if __name__ == '__main__':
         if feat_dim < 4:
             logging.warning('特征维度<4, 模拟器需要 [u,v,A,h,depth] 5 维; 将用占位补齐。')
 
-        # 起始位置候选
         start_points = make_start_points_from_history(data, dates)
 
-        # 生成逐年伪标签
         sim_by_year = simulate_free_drift_pseudolabels(
             start_points=start_points,
             sim_years=args.sim_years,
@@ -2180,14 +1959,11 @@ if __name__ == '__main__':
             seed=42,
         )
 
-        # 若模型特征维 != 5, 裁剪模拟特征以对齐
         if feat_dim != 5:
             for yr in list(sim_by_year.keys()):
                 f, d = sim_by_year[yr]
                 sim_by_year[yr] = (f[:, :feat_dim], d)
 
-        # CL 阶段独立 optimizer (避免主任务 Adam 动量污染微调)
-        # 学习率降为主阶段的 1/10, 让旧权重更稳
         cl_optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr * 0.1)
         logging.info(f'[CL] 使用独立 optimizer, lr={args.lr * 0.1:.2e}')
 
@@ -2208,7 +1984,6 @@ if __name__ == '__main__':
         except Exception as e:
             logging.warning(f'CL 权重保存失败: {e}')
 
-    # ---- v3: 弱标签微调 (真实漂移产品监督, 推荐路径) ----
     if args.weak_label:
         logging.info('=' * 60)
         logging.info('进入弱标签微调阶段: 低分辨率漂移产品 + 加权 Replay/EWC')
@@ -2228,7 +2003,7 @@ if __name__ == '__main__':
             logging.warning('未加载到任何弱标签, 跳过弱标签微调。'
                             '请检查 --drift_nc_dir 与产品变量名/单位。')
         else:
-            # 弱标签微调用独立 optimizer (更小 lr), 避免动量污染并防止"灾难性遗忘"
+
             wl_optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr * 0.1)
             logging.info(f'[弱标签] 使用独立 optimizer, lr={args.lr * 0.1:.2e}')
 
@@ -2248,13 +2023,13 @@ if __name__ == '__main__':
             except Exception as e:
                 logging.warning(f'弱标签权重保存失败: {e}')
 
-    # ---- v3: Deep Ensemble 训练 (若选用 ensemble 不确定性) ----
+
     ensemble_models = None
     if args.uncertainty == 'ensemble':
         logging.info('=' * 60)
         logging.info(f'训练 Deep Ensemble ({args.ensemble_size} 个模型) 用于不确定性估计')
         logging.info('=' * 60)
-        ensemble_models = [model]  # 已训练的主模型作为成员之一
+        ensemble_models = [model] 
         for m in range(args.ensemble_size - 1):
             tf.random.set_seed(1000 + m)
             mdl_m = build_pinn_lstm(args.look_back, feat_dim)
@@ -2269,12 +2044,9 @@ if __name__ == '__main__':
             ensemble_models.append(mdl_m)
             logging.info(f'  Ensemble 成员 {m + 2}/{args.ensemble_size} 训练完成')
 
-    # ---- 递归多步外推预测 ----
-    # 物理边界 (反归一化空间): A ∈ [0,1], h ≥ 0; depth (若存在第 5 维) 在递归时强制覆盖回真值
     phys_min = np.array([-np.inf, -np.inf, 0.0, 0.0, 0.0][:feat_dim], dtype=np.float32)
     phys_max = np.array([ np.inf,  np.inf, 1.0, np.inf, np.inf][:feat_dim], dtype=np.float32)
 
-    # 预测种子必须取自"同一条连续轨迹的末尾", 否则 look_back 窗口会跨浮标 -> 伪历史。
     if seg_ids is not None and len(seg_ids) == len(scaled):
         last_seg = seg_ids[-1]
         seg_mask = (seg_ids == last_seg)
@@ -2297,12 +2069,10 @@ if __name__ == '__main__':
         inp = seq.reshape(1, args.look_back, feat_dim)
         p   = model(inp, training=False).numpy()[0]
 
-        # 反归一化 -> 物理 clip -> 再归一化, 保证递归输入始终物理合理
         p_phys = scaler.inverse_transform(p.reshape(1, -1))[0]
         p_phys = np.clip(p_phys, phys_min, phys_max)
         p = scaler.transform(p_phys.reshape(1, -1))[0].astype(np.float32)
 
-        # 静态深度强制还原 (深度场不随时间变化, 不能被模型外推污染)
         if static_depth is not None:
             p[4] = static_depth
 
@@ -2312,7 +2082,6 @@ if __name__ == '__main__':
     preds_inv = scaler.inverse_transform(np.vstack(preds))
     preds_inv = np.clip(preds_inv, phys_min, phys_max)
 
-    # ---- v3: 不确定性估计 + OOD 预警 ----
     pred_std = None
     if args.uncertainty != 'none':
         seq_init = seed_scaled.copy()
@@ -2328,7 +2097,6 @@ if __name__ == '__main__':
                 ensemble_models, seq_init, scaler, args.look_back, feat_dim, predict_steps)
             preds_inv = en_mean
 
-        # 95% 置信区间 (±1.96σ)
         if pred_std is not None:
             ci_lower = preds_inv - 1.96 * pred_std
             ci_upper = preds_inv + 1.96 * pred_std
@@ -2339,7 +2107,6 @@ if __name__ == '__main__':
                              f'v={preds_inv[t,1]:.4f} '
                              f'[{ci_lower[t,1]:.4f}, {ci_upper[t,1]:.4f}]')
 
-        # OOD 检测: 起始窗口到训练分布的马氏距离 (用训练段分布, 避免测试段泄露)
         mu, inv_cov = fit_train_distribution(scaled[:split + args.look_back])
         ood_flags = assess_ood(seq_init, mu, inv_cov, threshold=args.ood_threshold)
         n_ood = sum(1 for _, _, f in ood_flags if f)
@@ -2351,8 +2118,6 @@ if __name__ == '__main__':
         else:
             logging.info(f'[OOD 检查] 输入窗口在训练分布内 (最大马氏距离 {max_d:.2f})。')
 
-
-    # ---- 生成预测日期标签 ----
     last_date_str = dates[-1]
     dates_pred    = []
     for fmt in ('%Y-%m-%d %H:%M', '%Y%m%d'):
@@ -2366,7 +2131,6 @@ if __name__ == '__main__':
     if not dates_pred:
         dates_pred = [f'Step_{i+1}' for i in range(predict_steps)]
 
-    # ---- 输出预测结果 ----
     if target_lat is not None and target_lon is not None:
         print_prediction_result(preds_inv, dates_pred, target_lon, target_lat)
     else:
@@ -2377,8 +2141,6 @@ if __name__ == '__main__':
         for pred, dt in zip(preds_inv, dates_pred):
             print(f"{dt:<22}" + "".join(f"{v:<12.5f}" for v in pred[:feat_dim]))
 
-    # ---- JSON 导出 ----
-    # 导出 JSON 的历史也用末段连续轨迹 (与预测同源)
     if seg_ids is not None and len(seg_ids) == len(data):
         _last_rows = np.where(seg_ids == seg_ids[-1])[0]
         data_for_export = data[_last_rows[-100:]] if len(_last_rows) else data[-100:]
@@ -2386,22 +2148,21 @@ if __name__ == '__main__':
         data_for_export = data[-100:]
     export_json(data_for_export, preds_inv, dates_pred, args.log_dir, ts, predict_steps, pred_std=pred_std)
 
-    # ---- 可视化 (英文标签, 避免中文字体缺失) ----
     if data.shape[1] >= 2:
         import matplotlib
         matplotlib.rcParams['axes.unicode_minus'] = False
         feat_names = ['u (East, m/s)', 'v (North, m/s)',
                       'A (Concentration)', 'h (Thickness, m)'][:feat_dim]
         n_hist = min(60, len(data))
-        # 历史曲线也只展示"末段"连续轨迹, 与预测种子同源, 避免画出跨浮标的伪历史
+
         if seg_ids is not None and len(seg_ids) == len(data):
             last_seg_rows = np.where(seg_ids == seg_ids[-1])[0]
             hist = data[last_seg_rows[-n_hist:]] if len(last_seg_rows) >= 1 else data[-n_hist:]
             n_hist = len(hist)
         else:
             hist = data[-n_hist:]
-        hist_x = list(range(-n_hist + 1, 1))            # 历史步 (..., -1, 0)
-        pred_x = list(range(1, predict_steps + 1))       # 预测步 (1, 2, ...)
+        hist_x = list(range(-n_hist + 1, 1))            
+        pred_x = list(range(1, predict_steps + 1))       
 
         ncols = 2
         nrows = (feat_dim + 1) // 2
@@ -2410,14 +2171,11 @@ if __name__ == '__main__':
 
         for k in range(feat_dim):
             ax = axes[k]
-            # 历史
             ax.plot(hist_x, hist[:, k], '-o', color='steelblue',
                     markersize=3, linewidth=1.1, label='History')
-            # 预测 (从历史最后一点接上)
             ax.plot([0] + pred_x, [hist[-1, k]] + list(preds_inv[:, k]),
                     '-x', color='crimson', linewidth=1.8, markersize=6,
                     label=f'Prediction ({predict_steps} steps)')
-            # 不确定性带
             if pred_std is not None:
                 lo = preds_inv[:, k] - 1.96 * pred_std[:, k]
                 hi = preds_inv[:, k] + 1.96 * pred_std[:, k]
@@ -2430,7 +2188,6 @@ if __name__ == '__main__':
             ax.grid(True, linestyle='--', alpha=0.5)
             ax.legend(fontsize=8)
 
-        # 多余的子图隐藏
         for k in range(feat_dim, len(axes)):
             axes[k].axis('off')
 
