@@ -1,3 +1,5 @@
+from xml.parsers.expat import model
+
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -1330,7 +1332,9 @@ def weak_label_finetune_loop(
    
     old_phys_mean = scaler.inverse_transform(old_scaled).mean(axis=0)
 
-    fisher = star_vars = None
+    fisher = [tf.Variable(tf.zeros_like(v), trainable=False) for v in model.trainable_variables]
+    star_vars = [tf.Variable(tf.zeros_like(v), trainable=False) for v in model.trainable_variables]
+    ewc_ready = False  
 
     for year in sorted(weak_by_year.keys()):
         feats, _, weights = weak_by_year[year]
@@ -1390,11 +1394,16 @@ def weak_label_finetune_loop(
                              f'Total {e_tot/n:.6f} | Data {e_dat/n:.6f} | '
                              f'Phys {e_phy/n:.6f} | EWC {e_ewc/max(n,1):.6f}')
 
-        if ewc_lambda > 0 and fisher is None:
+        if ewc_lambda > 0 and not ewc_ready:
             logging.info(f'[弱标签CL] 计算 Fisher (EWC, lambda={ewc_lambda})...')
-            fisher = compute_fisher(model, X_old, y_old, batch_size=batch_size)
-            star_vars = [tf.identity(v) for v in model.trainable_variables]
-
+            new_fisher = compute_fisher(model, X_old, y_old, batch_size=batch_size)
+            for fv, nf in zip(fisher, new_fisher):
+                fv.assign(nf)
+            for sv, v in zip(star_vars, model.trainable_variables):
+                sv.assign(v)
+            ewc_ready = True
+            fsum = float(sum(float(tf.reduce_sum(f)) for f in fisher))
+            logging.info(f'[诊断] Fisher总和={fsum:.6e}')
     return model
 
 
